@@ -1,124 +1,133 @@
 from mp_api.client import MPRester
 import pandas as pd
 import numpy as np
+import random
 
-# ==============================
-# API KEY
-# ==============================
 API_KEY = "LbmeAmx3Sqkb9AblV2DEbDJ4kyQuh6C1"
 
+# -----------------------------
+# Tanimoto Similarity
+# -----------------------------
+
+def tanimoto_similarity(v1, v2):
+    v1, v2 = np.array(v1), np.array(v2)
+    return np.dot(v1, v2) / (np.dot(v1, v1) + np.dot(v2, v2) - np.dot(v1, v2) + 1e-8)
+
+# -----------------------------
+# Fetch Data
+# -----------------------------
 
 materials_data = []
 
-# ==============================
-# FETCH MATERIALS
-# ==============================
 with MPRester(API_KEY) as mpr:
     docs = mpr.materials.summary.search(
-        num_elements=(1, 3),
+        num_elements=(1, 5),  # more diversity
         fields=[
-            "material_id",
-            "formula_pretty",
-            "density",
-            "band_gap",
-            "efermi"
-        ]
+            "material_id", "formula_pretty",
+            "band_gap", "efermi", "density",
+            "ordering",
+            "energy_per_atom",
+            "homogeneous_poisson",
+            "formation_energy_per_atom",
+            "energy_above_hull",
+            "nelements",
+            "num_magnetic_sites",
+            "elements"
+        ],
+        chunk_size=800
     )
 
-    docs = docs[:50]   # more variety
-
     for doc in docs:
-        materials_data.append({
-            "Material_ID": doc.material_id,
-            "Formula": doc.formula_pretty,
-            "Density": doc.density if doc.density else np.nan,
-            "Band_Gap": doc.band_gap,
-            "Fermi_Energy": doc.efermi if doc.efermi else np.nan
-        })
+        try:
+            # Skip Actinium-heavy bias
+            if "Ac" in [str(e) for e in doc.elements]:
+                continue
 
-# ==============================
-# CREATE DATASET (NO DUPLICATES)
-# ==============================
-data = []
+            row = {
+                "material_id": doc.material_id,
+                "formula": doc.formula_pretty,
+                "band_gap": doc.band_gap,
+                "fermi_energy": doc.efermi,
+                "density": doc.density,
+                "magnetic_ordering": str(doc.ordering) if doc.ordering else "Unknown",
+                "total_energy": doc.energy_per_atom,
+                "poisson_ratio": doc.homogeneous_poisson,
+                "formation_energy": doc.formation_energy_per_atom,
+                "energy_above_hull": doc.energy_above_hull,
+                "num_elements": doc.nelements,
+                "num_magnetic_sites": doc.num_magnetic_sites
+            }
 
-for mat in materials_data:
-    sample = {
-        "Material_ID": mat["Material_ID"],
-        "Formula": mat["Formula"],
-        "Density": mat["Density"],
-        "Band_Gap": mat["Band_Gap"],
-        "Fermi_Energy": mat["Fermi_Energy"],
+            materials_data.append(row)
 
-        # Increased variation
-        "Temperature": np.random.uniform(100, 1000),
-        "Pressure": np.random.uniform(1, 50),
-        "Strain": np.random.uniform(0, 0.5),
-        "Electric_Field": np.random.uniform(0, 2e5),
-        "Defect_Concentration": np.random.uniform(0, 0.2),
+        except:
+            continue
 
-        "Thermal_Conductivity": np.random.uniform(1, 500),
-        "Elastic_Modulus": np.random.uniform(10, 500),
-        "Carrier_Mobility": np.random.uniform(1, 3000)
-    }
+# -----------------------------
+# Convert to DataFrame
+# -----------------------------
 
-    data.append(sample)
+df = pd.DataFrame(materials_data)
 
-# ==============================
-# CREATE DATAFRAME
-# ==============================
-df = pd.DataFrame(data)
+# -----------------------------
+# Handle Missing Values
+# -----------------------------
 
-# ==============================
-# HANDLE MISSING VALUES
-# ==============================
-df["Density"] = df["Density"].fillna(df["Density"].median())
-df["Fermi_Energy"] = df["Fermi_Energy"].fillna(df["Fermi_Energy"].median())
-df["Band_Gap"] = df["Band_Gap"].fillna(0)
+numeric_cols = df.select_dtypes(include=[np.number]).columns
+df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].mean())
 
-# ==============================
-# TANIMOTO SIMILARITY (FINAL)
-# ==============================
+# -----------------------------
+# Balance Dataset (IMPORTANT)
+# -----------------------------
 
-# Select numerical features only
-features = df.select_dtypes(include=[np.number])
+# Split metals & non-metals
+metals = df[df["band_gap"] == 0]
+non_metals = df[df["band_gap"] > 0]
 
-# Remove constant columns
-features = features.loc[:, features.nunique() > 1]
+# Take balanced samples
+metals_sample = metals.sample(min(150, len(metals)), random_state=42)
+non_metals_sample = non_metals.sample(min(150, len(non_metals)), random_state=42)
 
-# Fill missing values
-features = features.fillna(features.median())
+df = pd.concat([metals_sample, non_metals_sample])
 
-# 🔥 STANDARDIZATION (IMPORTANT FIX)
-features = (features - features.mean()) / (features.std() + 1e-8)
-X = features.values
+# -----------------------------
+# Encode Categorical
+# -----------------------------
 
-# Tanimoto function
-def tanimoto_similarity(a, b):
-    num = np.dot(a, b)
-    den = np.dot(a, a) + np.dot(b, b) - num
-    return 0 if den == 0 else num / den
+df = pd.get_dummies(df, columns=["magnetic_ordering"])
 
-# Compute similarity
-similarities = []
-n = len(X)
+# -----------------------------
+# Remove Redundancy (Tanimoto)
+# -----------------------------
 
-for i in range(n):
-    for j in range(i + 1, n):
-        similarities.append(tanimoto_similarity(X[i], X[j]))
+numeric_df = df.drop(columns=["material_id", "formula"])
 
-similarities = np.array(similarities)
+selected_indices = []
+vectors = []
 
-# ==============================
-# PRINT RESULTS
-# ==============================
-print("Average Tanimoto Similarity:", np.mean(similarities))
-print("Maximum Tanimoto Similarity:", np.max(similarities))
-print("Minimum Tanimoto Similarity:", np.min(similarities))
+for i, row in numeric_df.iterrows():
+    vec = row.values
+    duplicate = False
 
-# ==============================
-# SAVE FILE
-# ==============================
-df.to_excel("final_non_redundant_dataset.xlsx", index=False)
+    for v in vectors:
+        if tanimoto_similarity(vec, v) > 0.95:
+            duplicate = True
+            break
 
-print("✅ Dataset fixed and non-redundant!")
+    if not duplicate:
+        selected_indices.append(i)
+        vectors.append(vec)
+
+    if len(selected_indices) >= 100:
+        break
+
+final_df = df.loc[selected_indices]
+
+# -----------------------------
+# Save to Excel
+# -----------------------------
+
+final_df.to_excel("final_high_quality_dataset.xlsx", index=False)
+
+print("✅ Final dataset created with", len(final_df), "materials")
 
